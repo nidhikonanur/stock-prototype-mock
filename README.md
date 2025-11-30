@@ -1,1 +1,0 @@
-Run backend with MOCK=true to use sample data.
