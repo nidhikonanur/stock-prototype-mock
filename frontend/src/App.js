@@ -108,7 +108,7 @@ export default function App() {
     }
 
     fetchQuote();
-    const t = setInterval(fetchQuote, 5000);
+    const t = setInterval(fetchQuote, 60000);
     return () => {
       mounted = false;
       clearInterval(t);
