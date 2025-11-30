@@ -13,29 +13,30 @@ const PORT = process.env.PORT || 3001;
 const MOCK = process.env.MOCK === 'true';
 
 // ------------------- SIMPLE CACHE -------------------
-let quoteCache = {};
-let historyCache = {};
+let quoteCache = {};   // { symbol: { value, ts } }
+let historyCache = {}; // { symbol: { value, ts } }
 
 function cacheGet(cache, key, maxAgeMs) {
-  const item = cache[key];
-  if (!item) return null;
-  if (Date.now() - item.ts > maxAgeMs) return null;
-  return item.value;
+  const entry = cache[key];
+  if (!entry) return null;
+  if (Date.now() - entry.ts > maxAgeMs) return null; // expired
+  return entry.value;
 }
 
 function cacheSet(cache, key, value) {
   cache[key] = { value, ts: Date.now() };
 }
 
-// ------------------- HEALTH ROUTE -------------------
+// ------------------- HEALTH CHECK -------------------
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, ts: Date.now(), mock: MOCK });
 });
 
-// ------------------- QUOTE ROUTE -------------------
+// ------------------- QUOTE ROUTE (Yahoo Finance) -------------------
 app.get('/api/quote', async (req, res) => {
   const symbol = (req.query.symbol || "AAPL").toUpperCase();
 
+  // MOCK MODE
   if (MOCK) {
     const p = path.join(__dirname, 'sample_data', 'sample_quote.json');
     const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -49,16 +50,24 @@ app.get('/api/quote', async (req, res) => {
 
   try {
     const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbol}`;
-    const r = await fetch(url);
+
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",     // Required to avoid blocking
+        "Accept": "application/json",
+        "Connection": "keep-alive"
+      }
+    });
+
     const j = await r.json();
 
-    if (!j || !j.quoteResponse || j.quoteResponse.result.length === 0) {
-      return res.status(500).json({ error: "Failed to fetch Yahoo quote", details: j });
+    if (!j || !j.quoteResponse || !j.quoteResponse.result || j.quoteResponse.result.length === 0) {
+      return res.status(500).json({ error: "Yahoo quote returned no data", details: j });
     }
 
     const q = j.quoteResponse.result[0];
 
-    const data = {
+    const result = {
       symbol,
       data: {
         c: q.regularMarketPrice,
@@ -66,22 +75,24 @@ app.get('/api/quote', async (req, res) => {
         h: q.regularMarketDayHigh,
         l: q.regularMarketDayLow,
         pc: q.regularMarketPreviousClose,
-        t: q.regularMarketTime,
+        t: q.regularMarketTime
       }
     };
 
-    cacheSet(quoteCache, symbol, data);
-    return res.json(data);
+    cacheSet(quoteCache, symbol, result);
+    return res.json(result);
 
   } catch (err) {
-    return res.status(500).json({ error: "Yahoo quote error", details: err.message });
+    console.error("YAHOO QUOTE ERROR:", err);
+    return res.status(500).json({ error: "Yahoo quote error", details: String(err) });
   }
 });
 
-// ------------------- RECOMMEND ROUTE -------------------
+// ------------------- RECOMMENDATION ROUTE -------------------
 app.get('/api/recommend', async (req, res) => {
   const symbol = (req.query.symbol || "AAPL").toUpperCase();
 
+  // MOCK MODE
   if (MOCK) {
     const p = path.join(__dirname, 'sample_data', 'sample_candles.json');
     const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -97,28 +108,47 @@ app.get('/api/recommend', async (req, res) => {
   }
 
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=1y&interval=1d`;
-    const r = await fetch(url);
+    const url =
+      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=1y&interval=1d`;
+
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Connection": "keep-alive"
+      }
+    });
+
     const j = await r.json();
 
-    if (!j || !j.chart || !j.chart.result) {
-      return res.status(500).json({ error: "Failed to fetch Yahoo history", details: j });
+    if (!j || !j.chart || !j.chart.result || j.chart.result.length === 0) {
+      return res.status(500).json({ error: "Yahoo history returned no data", details: j });
     }
 
     const result = j.chart.result[0];
-    const closes = result.indicators.quote[0].close.filter((n) => typeof n === 'number');
+
+    const closes = result.indicators.quote[0].close.filter(
+      (v) => typeof v === "number"
+    );
 
     if (closes.length < 200) {
-      return res.status(500).json({ error: "Not enough data", count: closes.length });
+      return res.status(500).json({
+        error: "Not enough data for MA calculation",
+        count: closes.length
+      });
     }
 
+    // Save to cache
     cacheSet(historyCache, symbol, closes);
 
+    // Generate recommendation
     const rec = recommendationFromCloses(closes);
+
     return res.json({ symbol, rec, source: "yahoo_daily_1y" });
 
   } catch (err) {
-    return res.status(500).json({ error: "Yahoo history error", details: err.message });
+    console.error("YAHOO HISTORY ERROR:", err);
+    return res.status(500).json({ error: "Yahoo history error", details: String(err) });
   }
 });
 
