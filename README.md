@@ -1,1 +1,1 @@
-# stock-prototype-mock
+Run backend with MOCK=true to use sample data.
