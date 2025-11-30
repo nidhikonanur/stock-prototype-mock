@@ -43,18 +43,41 @@ app.get('/api/quote', async (req, res) => {
 });
 
 // --- Recommend route (mock or live) ---
-app.get('/api/recommend', async (req, res) => {
-  const symbol = (req.query.symbol || 'AAPL').toUpperCase();
-  try {
-    if (MOCK) {
-      const p = path.join(__dirname, 'sample_data', 'sample_candles.json');
-      if (!fs.existsSync(p)) return res.status(500).json({ error: 'sample_candles.json missing' });
-      const raw = fs.readFileSync(p, 'utf8');
-      const j = JSON.parse(raw);
-      if (!j || !Array.isArray(j.c)) return res.status(500).json({ error: 'invalid sample candles' });
-      const rec = recommendationFromCloses(j.c);
-      return res.json({ symbol, rec });
-    }
+if (!KEY) return res.status(500).json({ error: 'FINNHUB_KEY not configured' });
+
+const now = Math.floor(Date.now() / 1000);
+const from = now - 220 * 24 * 3600;
+
+// 1️⃣ Try DAILY candles first
+const dailyUrl = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${now}&token=${KEY}`;
+let r = await fetch(dailyUrl);
+let j = await r.json();
+
+let closes = null;
+
+if (j && j.s === "ok" && Array.isArray(j.c) && j.c.length >= 200) {
+  closes = j.c;
+} else {
+  // 2️⃣ DAILY failed → fallback to WEEKLY candles
+  const weeklyUrl = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=W&from=${from}&to=${now}&token=${KEY}`;
+  r = await fetch(weeklyUrl);
+  j = await r.json();
+
+  if (j && j.s === "ok" && Array.isArray(j.c) && j.c.length >= 50) {
+    // Weekly candles (need fewer points for MA because each W = 5D)
+    closes = j.c;
+  } else {
+    return res.status(500).json({
+      error: "failed to fetch historical data from Finnhub",
+      details: j
+    });
+  }
+}
+
+// 3️⃣ Run recommendation
+const rec = recommendationFromCloses(closes);
+return res.json({ symbol, rec });
+
 
     if (!KEY) return res.status(500).json({ error: 'FINNHUB_KEY not configured' });
     const now = Math.floor(Date.now() / 1000);
