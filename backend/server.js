@@ -125,7 +125,11 @@ app.get('/api/history', async (req, res) => {
     const highs = safeArr(q.high).map(n=>typeof n==='number'?n:null);
     const lows = safeArr(q.low).map(n=>typeof n==='number'?n:null);
 
-    const payload = { symbol, range, interval, timestamps, opens, highs, lows, closes };
+    // new: try to extract volumes (Yahoo places volume as q.volume)
+    const volumesRaw = Array.isArray(q.volume) ? q.volume : (r.indicators && r.indicators.quote && r.indicators.quote[0] && r.indicators.quote[0].volume ? r.indicators.quote[0].volume : []);
+    const volumes = safeArr(volumesRaw).map(v => typeof v === 'number' ? v : null);
+
+    const payload = { symbol, range, interval, timestamps, opens, highs, lows, closes, volumes };
     cacheSet(historyCache, cacheKey, payload);
     return res.json({ source:'yahoo', ...payload });
   } catch (err) {
