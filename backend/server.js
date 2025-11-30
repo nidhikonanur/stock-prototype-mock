@@ -14,6 +14,15 @@ const PORT = process.env.PORT || 3001;
 const MOCK = process.env.MOCK === 'true';
 
 // -------------------------------------------------------------
+// SIMPLE IN-MEMORY CACHE (fixes rate limiting)
+// -------------------------------------------------------------
+let quoteCache = {};
+let quoteCacheTime = {};
+
+let historyCache = {};
+let historyCacheTime = {};
+
+// -------------------------------------------------------------
 // HEALTH CHECK
 // -------------------------------------------------------------
 app.get('/api/health', (req, res) => {
@@ -21,19 +30,23 @@ app.get('/api/health', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// QUOTE ROUTE  (Alpha Vantage GLOBAL QUOTE)
+// QUOTE ROUTE  (cached for 30 seconds)
 // -------------------------------------------------------------
 app.get('/api/quote', async (req, res) => {
   const symbol = (req.query.symbol || 'AAPL').toUpperCase();
 
+  // Serve cached quote if < 30s old
+  if (quoteCache[symbol] && Date.now() - quoteCacheTime[symbol] < 30000) {
+    return res.json(quoteCache[symbol]);
+  }
+
   try {
     if (MOCK) {
       const file = path.join(__dirname, 'sample_data', 'sample_quote.json');
-      if (!fs.existsSync(file)) {
-        return res.status(500).json({ error: 'sample_quote.json missing' });
-      }
       const data = JSON.parse(fs.readFileSync(file, 'utf8'));
       data.symbol = symbol;
+      quoteCache[symbol] = data;
+      quoteCacheTime[symbol] = Date.now();
       return res.json(data);
     }
 
@@ -50,8 +63,7 @@ app.get('/api/quote', async (req, res) => {
     }
 
     const q = j['Global Quote'];
-
-    return res.json({
+    const result = {
       symbol,
       data: {
         c: Number(q['05. price']),
@@ -59,32 +71,38 @@ app.get('/api/quote', async (req, res) => {
         h: Number(q['03. high']),
         l: Number(q['04. low']),
         pc: Number(q['08. previous close']),
-        t: Date.now() / 1000 // Alpha Vantage does not return timestamp; use now
+        t: Date.now() / 1000
       }
-    });
+    };
+
+    // Store in cache
+    quoteCache[symbol] = result;
+    quoteCacheTime[symbol] = Date.now();
+
+    return res.json(result);
 
   } catch (err) {
-    console.error("QUOTE ERROR:", err);
     return res.status(500).json({ error: "failed to fetch quote", details: err.message });
   }
 });
 
 // -------------------------------------------------------------
-// RECOMMENDATION ROUTE — DAILY ADJUSTED (RELIABLE)
+// RECOMMENDATION ROUTE — CACHED FOR 12 HOURS
 // -------------------------------------------------------------
 app.get('/api/recommend', async (req, res) => {
   const symbol = (req.query.symbol || 'AAPL').toUpperCase();
 
+  // If history cached < 12 hours → use it
+  if (historyCache[symbol] && Date.now() - historyCacheTime[symbol] < 12 * 60 * 60 * 1000) {
+    const closes = historyCache[symbol];
+    const rec = recommendationFromCloses(closes);
+    return res.json({ symbol, rec, source: "alpha_vantage_cached" });
+  }
+
   try {
     if (MOCK) {
       const file = path.join(__dirname, 'sample_data', 'sample_candles.json');
-      if (!fs.existsSync(file)) {
-        return res.status(500).json({ error: 'sample_candles.json missing' });
-      }
       const j = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!j || !Array.isArray(j.c)) {
-        return res.status(500).json({ error: 'invalid sample candles' });
-      }
       const rec = recommendationFromCloses(j.c);
       return res.json({ symbol, rec, source: "mock" });
     }
@@ -103,38 +121,28 @@ app.get('/api/recommend', async (req, res) => {
       return res.status(500).json({ error: "Failed to fetch daily history", details: j });
     }
 
-    // Extract closes (sorted newest → oldest)
+    // Extract closes
     const closes = Object.values(series)
       .map(d => Number(d['4. close']))
-      .filter(n => !isNaN(n));
+      .filter(n => !isNaN(n))
+      .reverse(); // oldest → newest
 
     if (closes.length < 200) {
       return res.status(500).json({ error: "Not enough history returned", count: closes.length });
     }
 
-    // Reverse so oldest → newest
-    closes.reverse();
+    // SAVE TO CACHE
+    historyCache[symbol] = closes;
+    historyCacheTime[symbol] = Date.now();
 
     const rec = recommendationFromCloses(closes);
 
     return res.json({ symbol, rec, source: "alpha_vantage_daily" });
 
   } catch (err) {
-    console.error("RECOMMEND ERROR:", err);
     return res.status(500).json({ error: "failed to compute recommendation", details: err.message });
   }
 });
-
-// -------------------------------------------------------------
-// SERVE STATIC FRONTEND (OPTIONAL)
-// -------------------------------------------------------------
-const publicPath = path.join(__dirname, 'public');
-if (fs.existsSync(publicPath)) {
-  app.use(express.static(publicPath));
-  app.get('/', (req, res) =>
-    res.sendFile(path.join(publicPath, 'index.html'))
-  );
-}
 
 // -------------------------------------------------------------
 // START SERVER
