@@ -58,7 +58,7 @@ app.get('/api/recommend', async (req, res) => {
 
     if (!KEY) return res.status(500).json({ error: 'FINNHUB_KEY not configured' });
     const now = Math.floor(Date.now() / 1000);
-    const from = now - 450 * 24 * 3600;
+    const from = now - 220 * 24 * 3600;
     const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${now}&token=${KEY}`;
     const r = await fetch(url);
     const j = await r.json();
