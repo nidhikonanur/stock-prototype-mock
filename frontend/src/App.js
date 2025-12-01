@@ -1,258 +1,198 @@
 // frontend/src/App.js
 import React, { useState, useEffect, useRef } from "react";
+
+/**
+ * App configuration
+ * Set REACT_APP_API_URL in your environment OR leave empty to use same origin
+ */
 const API = (process.env.REACT_APP_API_URL || "").replace(/\/$/, "");
-const REFRESH = 60000; // 60s
+const REFRESH = 60000; // automatic refresh interval when live (ms)
 
-// helpers
-const fmt = n => (typeof n === "number" ? n.toFixed(2) : String(n));
-const tsToLocal = ts => (ts ? new Date(ts * 1000).toLocaleString() : "n/a");
-const shortTime = ts => (ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "");
-const shortDate = ts => (ts ? new Date(ts * 1000).toLocaleDateString() : "");
+// ---------- small helpers ----------
+const fmt = (n) => (typeof n === "number" ? n.toFixed(2) : String(n));
+const tsToLocal = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "n/a");
+const shortTime = (ts) => (ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "");
+const shortDate = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString() : "");
 
-// moving average series
-function movingAverageSeries(arr, period) {
-  if (!Array.isArray(arr) || arr.length < period) return [];
-  const out = new Array(arr.length).fill(null);
-  let sum = 0;
-  for (let i = 0; i < arr.length; i++) {
-    const v = arr[i];
-    if (i < period) {
-      sum += (typeof v === "number" ? v : 0);
-      if (i === period - 1) out[i] = sum / period;
-    } else {
-      if (typeof arr[i] === "number" && typeof arr[i - period] === "number") {
-        sum = sum - arr[i - period] + arr[i];
-        out[i] = sum / period;
-      } else {
-        // fallback: compute from slice
-        const slice = arr.slice(Math.max(0, i - period + 1), i + 1).filter(x => typeof x === "number");
-        out[i] = slice.length === period ? slice.reduce((a, b) => a + b, 0) / period : null;
-      }
-    }
-  }
-  return out;
-}
-
-// CandleChart with axes, gridlines, volumes, and MA overlays
-function CandleChart({
+// ---------- LineAreaChart component (Google-like) ----------
+function LineAreaChart({
   timestamps = [],
-  opens = [],
-  highs = [],
-  lows = [],
   closes = [],
-  volumes = [],
-  width = 800,
-  height = 360,
-  axisPadding = 50,
-  showGrid = true
+  width = 740,
+  height = 340,
+  paddingLeft = 60,
+  paddingBottom = 50,
+  previousClose = null,
+  topLeftBox = null
 }) {
-  if (!timestamps || timestamps.length < 2 || !closes || closes.length < 2) {
-    return <div style={{ height }}>No chart</div>;
+  // guard
+  if (!Array.isArray(closes) || closes.filter(x => typeof x === "number").length < 2) {
+    return <div style={{ height }}>No chart data</div>;
   }
 
-  // build points aligned to original arrays (skip nulls)
-  const points = [];
+  // build filtered points (only indices with numeric close AND timestamp)
+  const pts = [];
   for (let i = 0; i < closes.length; i++) {
-    const t = timestamps[i];
-    const o = opens[i], h = highs[i], l = lows[i], c = closes[i], v = volumes[i];
-    if (t !== undefined && t !== null && [o, h, l, c].every(val => val !== undefined && val !== null)) {
-      points.push({ t, o, h, l, c, v: (typeof v === "number" ? v : null) });
-    } else {
-      // include placeholder for spacing if there's a timestamp
-      if (t !== undefined && t !== null) points.push({ t, o: null, h: null, l: null, c: null, v: (typeof v === "number" ? v : null) });
-    }
+    const c = closes[i];
+    const t = timestamps && timestamps[i] ? timestamps[i] : null;
+    if (typeof c === "number" && t) pts.push({ t, c, i });
   }
-  if (!points.length) return <div style={{ height }}>No usable candles</div>;
+  if (pts.length < 2) return <div style={{ height }}>No usable chart points</div>;
 
-  // compute ranges from available highs/lows
-  const highsArr = points.map(p => p.h).filter(x => typeof x === "number");
-  const lowsArr = points.map(p => p.l).filter(x => typeof x === "number");
-  const volArr = points.map(p => (typeof p.v === "number" ? p.v : 0));
-  const max = Math.max(...highsArr);
-  const min = Math.min(...lowsArr);
-  const pricePadding = (max - min) * 0.08 || 1;
-  const yMax = max + pricePadding;
-  const yMin = min - pricePadding;
+  // compute min/max with small padding
+  const vals = pts.map((p) => p.c);
+  const max = Math.max(...vals);
+  const min = Math.min(...vals);
+  const pad = (max - min) * 0.08 || 1;
+  const yMax = max + pad;
+  const yMin = min - pad;
 
-  // drawing areas
-  const left = axisPadding;
+  // drawing area
+  const left = paddingLeft;
   const right = width - 10;
   const top = 10;
-  const bottom = height - axisPadding;
-  const volHeight = 60; // bottom area for volume bars
-  const chartBottom = bottom - volHeight - 10; // leave small gap
-  const chartHeight = chartBottom - top;
-  const n = points.length;
-  const availablePoints = points.length;
+  const bottom = height - paddingBottom;
   const w = right - left;
-  const step = availablePoints > 1 ? w / (availablePoints - 1) : w;
-  const candleW = Math.max(3, Math.min(18, step * 0.6));
+  const h = bottom - top;
+  const n = pts.length;
+  const step = n > 1 ? w / (n - 1) : w;
 
-  const scaleY = v => top + (1 - (v - yMin) / (yMax - yMin)) * chartHeight;
+  const xFor = (idx) => left + idx * step;
+  const yFor = (v) => top + (1 - (v - yMin) / (yMax - yMin)) * h;
 
-  // Y ticks major and minor
-  const yMajorTicks = 5;
-  const yMajorVals = Array.from({ length: yMajorTicks }, (_, i) => yMin + (i / (yMajorTicks - 1)) * (yMax - yMin)).reverse();
-  const yMinorCount = 4; // minor subdivisions between majors
+  // build path points
+  const pathPoints = pts.map((p, idx) => `${xFor(idx)},${yFor(p.c)}`).join(" ");
+  const areaPoints = [
+    `${left},${bottom}`,
+    ...pts.map((p, idx) => `${xFor(idx)},${yFor(p.c)}`),
+    `${left + (n - 1) * step},${bottom}`
+  ].join(" ");
 
-  // compute MA series for overlay
-  const closesNumeric = points.map(p => (typeof p.c === "number" ? p.c : null));
-  const ma50 = movingAverageSeries(closesNumeric, 50);
-  const ma200 = movingAverageSeries(closesNumeric, 200);
+  // Y ticks and X label spacing
+  const yTicks = 5;
+  const yTickVals = Array.from({ length: yTicks }, (_, i) => yMin + (i / (yTicks - 1)) * (yMax - yMin)).reverse();
+  const maxLabels = 6;
+  const xLabelStep = Math.max(1, Math.floor(n / maxLabels));
 
-  // volume scaling
-  const maxVol = Math.max(...volArr, 1);
-  const volScale = v => chartBottom + 10 + (1 - (v / maxVol)) * volHeight;
+  // last point marker
+  const last = pts[pts.length - 1];
+  const lastX = xFor(pts.length - 1);
+  const lastY = yFor(last.c);
 
-  // X label step
-  const maxXLabels = 8;
-  const xLabelStep = Math.max(1, Math.floor(availablePoints / maxXLabels));
+  // tooltip state
+  const [tooltip, setTooltip] = useState(null);
+  const svgRef = useRef(null);
+
+  function onMouseMove(e) {
+    if (!svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const idxF = Math.round((mx - left) / step);
+    const idx = Math.max(0, Math.min(n - 1, idxF));
+    const p = pts[idx];
+    if (!p) {
+      setTooltip(null);
+      return;
+    }
+    setTooltip({
+      x: xFor(idx),
+      y: yFor(p.c),
+      time: p.t,
+      price: p.c
+    });
+  }
+  function onMouseLeave() {
+    setTooltip(null);
+  }
+
+  const renderTopLeftBox = () => {
+    if (!topLeftBox) return null;
+    const { price, changePct, up } = topLeftBox;
+    return (
+      <div style={{
+        position: "absolute",
+        left: 12,
+        top: 12,
+        background: "white",
+        padding: "8px 10px",
+        borderRadius: 8,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+        fontSize: 14
+      }}>
+        <div style={{ fontSize: 24, fontWeight: 700 }}>{price.toFixed(2)} <span style={{ fontSize: 12 }}>USD</span></div>
+        <div style={{ color: up ? "#2ecc71" : "#e74c3c" }}>{(up ? "+" : "")}{changePct.toFixed(2)}%</div>
+      </div>
+    );
+  };
 
   return (
-    <svg width={width} height={height} style={{ background: "#fff", border: "1px solid #eee" }}>
-      {/* Y minor gridlines */}
-      {yMajorVals.map((val, idx) => {
-        // draw minor ticks between this and next if applicable
-        const yMajor = scaleY(val);
-        // major line
-        return (
-          <g key={idx}>
-            <line x1={left} x2={right} y1={yMajor} y2={yMajor} stroke="#eee" strokeWidth={1} />
-            <text x={left - 8} y={yMajor + 4} textAnchor="end" style={{ fontSize: 11, fill: "#333" }}>{Number(val).toFixed(2)}</text>
-            {/* minor lines */}
-            {Array.from({ length: yMinorCount - 1 }).map((_, mi) => {
-              const nextVal = idx < yMajorVals.length - 1 ? yMajorVals[idx + 1] : yMin;
-              const frac = (mi + 1) / yMinorCount;
-              const minorVal = val - frac * (val - nextVal);
-              const yMinor = scaleY(minorVal);
-              return <line key={mi} x1={left} x2={right} y1={yMinor} y2={yMinor} stroke="#f6f6f6" strokeWidth={1} />;
-            })}
+    <div style={{ position: "relative", width, height }}>
+      {renderTopLeftBox()}
+      <svg ref={svgRef} width={width} height={height} onMouseMove={onMouseMove} onMouseLeave={onMouseLeave} style={{ background: "#fff" }}>
+        {/* Y grid & labels */}
+        {yTickVals.map((val, i) => {
+          const y = yFor(val);
+          return (
+            <g key={i}>
+              <line x1={left} x2={right} y1={y} y2={y} stroke="#eee" strokeWidth={1} />
+              <text x={right + 6} y={y + 4} fontSize="11" fill="#444">{val.toFixed(2)}</text>
+            </g>
+          );
+        })}
+
+        {/* previous close dotted */}
+        {typeof previousClose === "number" && (previousClose >= yMin && previousClose <= yMax) && (() => {
+          const py = yFor(previousClose);
+          return (
+            <g key="prev-close">
+              <line x1={left} x2={right} y1={py} y2={py} stroke="#999" strokeDasharray="4 6" strokeWidth={1} />
+              <text x={right - 4} y={py - 6} fontSize="12" fill="#666" textAnchor="end">Prev close {previousClose.toFixed(2)}</text>
+            </g>
+          );
+        })()}
+
+        {/* shaded area */}
+        <polygon points={areaPoints} fill="rgba(30,136,229,0.12)" stroke="none" />
+
+        {/* line path */}
+        <polyline points={pathPoints} fill="none" stroke="#1e88e5" strokeWidth={2.5} strokeLinejoin="round" strokeLinecap="round" />
+
+        {/* last marker */}
+        <circle cx={lastX} cy={lastY} r={5} fill="#1e88e5" stroke="#fff" strokeWidth={1.5} />
+
+        {/* X baseline */}
+        <line x1={left} x2={right} y1={bottom} y2={bottom} stroke="#ddd" />
+
+        {/* X labels */}
+        {pts.map((p, idx) => {
+          if (idx % xLabelStep !== 0 && idx !== pts.length - 1) return null;
+          const x = xFor(idx);
+          const label = new Date(p.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          return <text key={idx} x={x} y={bottom + 18} fontSize="11" textAnchor="middle" fill="#444">{label}</text>;
+        })}
+
+        {/* tooltip */}
+        {tooltip && (
+          <g>
+            <line x1={tooltip.x} x2={tooltip.x} y1={top} y2={bottom} stroke="#bbb" strokeDasharray="3 4" />
+            <rect x={tooltip.x + 8} y={tooltip.y - 28} width={140} height={48} rx={6} ry={6} fill="#fff" stroke="#ddd" />
+            <text x={tooltip.x + 16} y={tooltip.y - 8} fontSize="12" fill="#111">{new Date(tooltip.time * 1000).toLocaleString()}</text>
+            <text x={tooltip.x + 16} y={tooltip.y + 14} fontSize="14" fontWeight="700" fill="#000">{tooltip.price.toFixed(2)}</text>
           </g>
-        );
-      })}
-
-      {/* candles + wicks */}
-      {points.map((p, i) => {
-        const x = left + i * step;
-        if ([p.o, p.h, p.l, p.c].some(v => v === null || v === undefined)) {
-          // skip drawing candle when data missing
-          return null;
-        }
-        const yO = scaleY(p.o);
-        const yC = scaleY(p.c);
-        const yH = scaleY(p.h);
-        const yL = scaleY(p.l);
-        const rectY = Math.min(yO, yC);
-        const rectH = Math.max(1, Math.abs(yC - yO));
-        const color = p.c >= p.o ? "#2ecc71" : "#e74c3c";
-        return (
-          <g key={i}>
-            {/* wick */}
-            <line x1={x} x2={x} y1={yH} y2={yL} stroke={color} strokeWidth={1} />
-            {/* body */}
-            <rect x={x - candleW / 2} y={rectY} width={candleW} height={rectH} fill={color} stroke={color} />
-          </g>
-        );
-      })}
-
-      {/* MA50 line */}
-      {ma50 && ma50.length > 0 && (
-        <polyline
-          points={ma50.map((v, i) => {
-            if (typeof v !== "number") return null;
-            const x = left + i * step;
-            const y = scaleY(v);
-            return `${x},${y}`;
-          }).filter(Boolean).join(" ")}
-          fill="none"
-          stroke="#1e88e5"
-          strokeWidth={2}
-        />
-      )}
-
-      {/* MA200 line */}
-      {ma200 && ma200.length > 0 && (
-        <polyline
-          points={ma200.map((v, i) => {
-            if (typeof v !== "number") return null;
-            const x = left + i * step;
-            const y = scaleY(v);
-            return `${x},${y}`;
-          }).filter(Boolean).join(" ")}
-          fill="none"
-          stroke="#ff9800"
-          strokeWidth={2}
-          strokeDasharray="6 4"
-        />
-      )}
-
-      {/* volume bars */}
-      {points.map((p, i) => {
-        const x = left + i * step;
-        const vol = typeof p.v === "number" ? p.v : 0;
-        const volTop = volScale(vol);
-        const volBottom = chartBottom + 10 + volHeight;
-        const volH = Math.max(1, volBottom - volTop);
-        const color = p.c >= p.o ? "rgba(46,204,113,0.6)" : "rgba(231,76,60,0.6)";
-        return (
-          <rect key={`v${i}`} x={x - candleW / 2} y={volTop} width={candleW} height={volH} fill={color} />
-        );
-      })}
-
-      {/* X axis labels */}
-      {points.map((p, i) => {
-        if (i % xLabelStep !== 0 && i !== points.length - 1) return null;
-        const x = left + i * step;
-        const label = shortTime(p.t);
-        return <text key={i} x={x} y={chartBottom + volHeight + 30} textAnchor="middle" style={{ fontSize: 11, fill: "#333" }}>{label}</text>;
-      })}
-
-      {/* baseline lines */}
-      <line x1={left} x2={right} y1={chartBottom} y2={chartBottom} stroke="#000" strokeWidth={1} />
-      <line x1={left} x2={left} y1={top} y2={chartBottom} stroke="#000" strokeWidth={1} />
-
-      {/* small legend */}
-      <g>
-        <rect x={left} y={top - 8} width={12} height={6} fill="#1e88e5" />
-        <text x={left + 18} y={top - 2} style={{ fontSize: 12 }}>MA50</text>
-        <rect x={left + 90} y={top - 8} width={12} height={6} fill="#ff9800" />
-        <text x={left + 110} y={top - 2} style={{ fontSize: 12 }}>MA200</text>
-      </g>
-    </svg>
+        )}
+      </svg>
+    </div>
   );
 }
 
-const CandleControls = ({ interval, setInterval, range, setRange }) => (
-  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-    <label>
-      Resolution:
-      <select value={interval} onChange={e => setInterval(e.target.value)} style={{ marginLeft: 6 }}>
-        <option value="1m">1m</option>
-        <option value="5m">5m</option>
-        <option value="15m">15m</option>
-        <option value="1d">1d</option>
-      </select>
-    </label>
-    <label>
-      Range:
-      <select value={range} onChange={e => setRange(e.target.value)} style={{ marginLeft: 6 }}>
-        <option value="1d">1d</option>
-        <option value="5d">5d</option>
-        <option value="1mo">1mo</option>
-        <option value="3mo">3mo</option>
-        <option value="1y">1y</option>
-      </select>
-    </label>
-  </div>
-);
-
+// ---------- App (Live-only: mock removed) ----------
 export default function App() {
+  // core UI state
   const [symbol, setSymbol] = useState("AAPL");
-  const [mode, setMode] = useState("mock"); // mock | live
   const [quote, setQuote] = useState(null);
-  const [rec, setRec] = useState(null);
-  const [hist, setHist] = useState(null); // {timestamps,opens,highs,lows,closes,volumes}
+  const [hist, setHist] = useState(null); // {timestamps, closes, opens, highs, lows, volumes}
   const [ind, setInd] = useState(null);
+  const [rec, setRec] = useState(null);
   const [summary, setSummary] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [watchlist, setWatchlist] = useState(["AAPL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "GOOG"]);
@@ -260,168 +200,197 @@ export default function App() {
   const [alerts, setAlerts] = useState([]);
   const [cooldown, setCooldown] = useState(0);
 
-  // new chart controls
-  const [interval, setIntervalState] = useState("5m");
+  // chart controls
+  const [interval, setIntervalState] = useState("5m"); // default 5m intraday
   const [range, setRangeState] = useState("5d");
 
   // cooldown timer
   useEffect(() => {
-    const id = setInterval(() => setCooldown(c => Math.max(0, c - 1)), 1000);
+    const id = setInterval(() => setCooldown((c) => Math.max(0, c - 1)), 1000);
     return () => clearInterval(id);
   }, []);
 
-  // load quote + hist on symbol change or mode or interval/range
+  // load quote, history, indicators, summary on change
   useEffect(() => {
     let mounted = true;
+
     async function loadAll() {
-      // quote
-      if (mode === "mock") {
-        setQuote({ symbol: "AAPL", data: { c: 194.35, o: 195.2, h: 196, l: 193.1, pc: 194, t: 1701360000 } });
-      } else {
-        try {
-          const r = await fetch(`${API}/api/quote?symbol=${symbol}`);
-          const j = await r.json();
-          setQuote(j);
-        } catch (e) { setQuote(null); }
-      }
+      try {
+        // quote
+        const rq = await fetch(`${API}/api/quote?symbol=${encodeURIComponent(symbol)}`);
+        const jq = await rq.json();
+        if (mounted) setQuote(jq);
 
-      // history for chart: use selected range & interval
-      if (mode === "mock") {
-        const closes = Array.from({ length: 40 }, (_, i) => 180 + i * 1.2);
-        setHist({ timestamps: [], opens: [], highs: [], lows: [], closes, volumes: [] });
-      } else {
-        try {
-          const r = await fetch(`${API}/api/history?symbol=${symbol}&range=${range}&interval=${interval}`);
-          const j = await r.json();
-          if (j && j.closes) setHist({ timestamps: j.timestamps, opens: j.opens, highs: j.highs, lows: j.lows, closes: j.closes, volumes: j.volumes || [] });
-          else setHist(null);
-        } catch (e) { setHist(null); }
-      }
+        // history
+        const rh = await fetch(`${API}/api/history?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=${interval}`);
+        const jh = await rh.json();
+        if (mounted && jh && jh.closes) setHist({ timestamps: jh.timestamps, closes: jh.closes, opens: jh.opens, highs: jh.highs, lows: jh.lows, volumes: jh.volumes || [] });
+        else if (mounted) setHist(null);
 
-      // indicators & summary (only for live)
-      if (mode === "live") {
-        try {
-          const rr = await fetch(`${API}/api/indicators?symbol=${symbol}&range=${range}&interval=${interval}`);
-          const jj = await rr.json();
-          setInd(jj);
-        } catch (e) { setInd(null); }
-        try {
-          const r3 = await fetch(`${API}/api/summary?symbol=${symbol}`);
-          const j3 = await r3.json();
-          setSummary(j3.summary || "");
-        } catch (e) { setSummary(""); }
-      } else {
-        setInd(null); setSummary("");
-      }
+        // indicators
+        const ri = await fetch(`${API}/api/indicators?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=${interval}`);
+        const ji = await ri.json();
+        if (mounted) setInd(ji);
 
-      setCooldown(60);
+        // recommendation & summary
+        const rr = await fetch(`${API}/api/recommend?symbol=${encodeURIComponent(symbol)}`);
+        const jr = await rr.json();
+        if (mounted) setRec(jr);
+
+        const rs = await fetch(`${API}/api/summary?symbol=${encodeURIComponent(symbol)}`);
+        const js = await rs.json();
+        if (mounted) setSummary(js.summary || "");
+
+        if (mounted) setCooldown(60);
+      } catch (e) {
+        console.error("loadAll error", e);
+      }
     }
+
     loadAll();
-    const id = setInterval(() => { if (mode === "live") loadAll(); }, REFRESH);
-    return () => clearInterval(id);
-  }, [symbol, mode, interval, range]);
+    const id = setInterval(loadAll, REFRESH);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
+  }, [symbol, interval, range]);
 
   // search autocomplete
   async function handleSearch(q) {
-    if (!q) return setSearchResults([]);
+    if (!q || q.trim().length < 1) {
+      setSearchResults([]);
+      return;
+    }
     try {
       const r = await fetch(`${API}/api/search?q=${encodeURIComponent(q)}`);
       const j = await r.json();
       setSearchResults(j.result || []);
-    } catch (e) { setSearchResults([]); }
+    } catch (e) {
+      setSearchResults([]);
+    }
   }
 
-  // get recommendation
+  // recommendation (manual trigger already handled in loadAll, but keep manual)
   async function getRecommendation() {
-    if (mode === "mock") { setRec({ rec: { score: 100, reason: "Bullish", ma50: 237.25, ma200: 199.75, recentClose: 249.5 } }); return; }
     try {
-      const r = await fetch(`${API}/api/recommend?symbol=${symbol}`);
+      const r = await fetch(`${API}/api/recommend?symbol=${encodeURIComponent(symbol)}`);
       const j = await r.json();
       setRec(j);
-    } catch (e) { setRec({ error: "Failed to fetch recommendation" }); }
+    } catch (e) {
+      setRec({ error: "Failed to fetch recommendation" });
+    }
   }
 
-  // portfolio helpers
+  // portfolio
   function addToPortfolio(sym, qty) {
     const p = [...portfolio, { id: Date.now().toString(36), symbol: sym, qty: Number(qty) }];
-    setPortfolio(p); localStorage.setItem("portfolio", JSON.stringify(p));
+    setPortfolio(p);
+    localStorage.setItem("portfolio", JSON.stringify(p));
   }
   function removeFromPortfolio(id) {
-    const p = portfolio.filter(x => x.id !== id); setPortfolio(p); localStorage.setItem("portfolio", JSON.stringify(p));
+    const p = portfolio.filter((x) => x.id !== id);
+    setPortfolio(p);
+    localStorage.setItem("portfolio", JSON.stringify(p));
   }
 
-  // alerts UI functions (unchanged)
+  // alerts
   async function createAlert(sym, type, price, webhook) {
     try {
-      const r = await fetch(`${API}/api/alerts`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ symbol: sym, type, price, webhook }) });
+      const r = await fetch(`${API}/api/alerts`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ symbol: sym, type, price, webhook }) });
       const j = await r.json();
-      if (j && j.id) setAlerts(prev => [...prev, { id: j.id, symbol: sym, type, price, webhook }]);
+      if (j && j.id) setAlerts((prev) => [...prev, { id: j.id, symbol: sym, type, price, webhook }]);
     } catch (e) { console.error(e); }
   }
   async function removeAlert(id) {
-    await fetch(`${API}/api/alerts/${id}`, { method: 'DELETE' });
-    setAlerts(prev => prev.filter(a => a.id !== id));
+    await fetch(`${API}/api/alerts/${id}`, { method: "DELETE" });
+    setAlerts((prev) => prev.filter((a) => a.id !== id));
   }
   async function checkAlerts() {
-    const r = await fetch(`${API}/api/check-alerts`, { method: 'POST' });
+    const r = await fetch(`${API}/api/check-alerts`, { method: "POST" });
     const j = await r.json();
-    if (j && j.triggered && j.triggered.length) alert(`Alerts triggered: ${j.triggered.map(t => t.symbol).join(', ')}`);
+    if (j && j.triggered && j.triggered.length) alert(`Alerts triggered: ${j.triggered.map((t) => t.symbol).join(", ")}`);
   }
 
-  // watchlist
-  function addWatch(sym) { if (!watchlist.includes(sym)) setWatchlist([...watchlist, sym]); }
-  function removeWatch(sym) { setWatchlist(watchlist.filter(s => s !== sym)); }
+  // watchlist helpers
+  function addWatch(sym) {
+    if (!watchlist.includes(sym)) setWatchlist([...watchlist, sym]);
+  }
+  function removeWatch(sym) {
+    setWatchlist(watchlist.filter((s) => s !== sym));
+  }
 
-  // latest trading day display
-  const lastTradeDay = hist && hist.timestamps && hist.timestamps.length ? shortDate(hist.timestamps.filter(t=>t)[hist.timestamps.filter(t=>t).length - 1]) : '';
+  // last trading day label (from hist timestamps)
+  const lastTradeDay = hist && hist.timestamps && hist.timestamps.length ? shortDate(hist.timestamps.filter(t => t)[hist.timestamps.filter(t => t).length - 1]) : "";
+
+  // topLeftBox for chart
+  const topLeftBox = quote && quote.data ? {
+    price: quote.data.c,
+    changePct: (quote.data.c - (quote.data.pc || quote.data.c)) / (quote.data.pc || quote.data.c) * 100,
+    up: quote.data.c >= (quote.data.pc || quote.data.c)
+  } : null;
 
   return (
-    <div style={{ padding: 20, fontFamily: 'Inter, Arial, sans-serif', maxWidth: 1100, margin: '0 auto' }}>
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h1 style={{ margin: 0 }}>Stock Prototype — Chart + Axes + Volume + MAs</h1>
-        <div style={{ fontSize: 12 }}>Backend: <code style={{ background: '#eee', padding: '3px 6px' }}>{API || '(same origin)'}</code></div>
+    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 1100, margin: "0 auto" }}>
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h1 style={{ margin: 0 }}>Stock Prototype</h1>
+        <div style={{ fontSize: 12 }}>Backend: <code style={{ background: "#eee", padding: "3px 6px" }}>{API || "(same origin)"}</code></div>
       </header>
 
-      <div style={{ marginTop: 12, display: 'flex', gap: 10, alignItems: 'center' }}>
-        <label><input type="radio" checked={mode === 'mock'} onChange={() => setMode('mock')} /> Mock</label>
-        <label><input type="radio" checked={mode === 'live'} onChange={() => setMode('live')} /> Live</label>
-
-        <input placeholder="Search symbol..." onChange={(e) => handleSearch(e.target.value)} style={{ marginLeft: 20 }} />
+      {/* search + controls */}
+      <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
+        <input placeholder="Search symbol..." onChange={(e) => handleSearch(e.target.value)} style={{ marginLeft: 6 }} />
         <div>
-          {searchResults.slice(0, 6).map(r => (
-            <button key={r.symbol} style={{ margin: 4 }} onClick={() => setSymbol(r.symbol)}>{r.symbol} {r.name ? `(${r.name})` : ''}</button>
+          {searchResults.slice(0, 6).map((r) => (
+            <button key={r.symbol} style={{ margin: 4 }} onClick={() => setSymbol(r.symbol)}>{r.symbol} {r.name ? `(${r.name})` : ""}</button>
           ))}
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <div>
+            <label>Range:
+              <select value={range} onChange={(e) => setRangeState(e.target.value)} style={{ marginLeft: 6 }}>
+                <option value="1d">1d</option>
+                <option value="5d">5d</option>
+                <option value="1mo">1mo</option>
+                <option value="3mo">3mo</option>
+                <option value="1y">1y</option>
+              </select>
+            </label>
+          </div>
+          <div>
+            <label>Resolution:
+              <select value={interval} onChange={(e) => setIntervalState(e.target.value)} style={{ marginLeft: 6 }}>
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="1d">1d</option>
+              </select>
+            </label>
+          </div>
+          <button onClick={() => { setCooldown(60); /* manual refresh will trigger useEffect reload */ }}>Manual Refresh</button>
+          <div style={{ alignSelf: "center" }}>Next update: {cooldown}s</div>
         </div>
       </div>
 
-      <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {watchlist.map(w => (
-          <button key={w} onClick={() => setSymbol(w)} style={{ padding: '6px 10px', background: w === symbol ? '#007bff' : '#eee', color: w === symbol ? '#fff' : '#000', border: 'none', borderRadius: 6 }}>{w}</button>
+      {/* watchlist */}
+      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {watchlist.map((w) => (
+          <button key={w} onClick={() => setSymbol(w)} style={{ padding: "6px 10px", background: w === symbol ? "#007bff" : "#eee", color: w === symbol ? "#fff" : "#000", border: "none", borderRadius: 6 }}>{w}</button>
         ))}
-        <button onClick={() => { const s = prompt('Symbol to add'); if (s) addWatch(s.toUpperCase()); }}>+ add</button>
+        <button onClick={() => { const s = prompt("Symbol to add"); if (s) addWatch(s.toUpperCase()); }}>+ add</button>
       </div>
 
-      <div style={{ marginTop: 12, display: 'flex', gap: 10, alignItems: 'center' }}>
-        <div><strong>Symbol:</strong> <input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} /></div>
-        <button onClick={getRecommendation}>Get recommendation</button>
-        <button onClick={() => { setCooldown(60); }}>Manual Refresh</button>
-        <div style={{ marginLeft: 10 }}>Next update: {cooldown}s</div>
-        <div style={{ marginLeft: 20 }}><button onClick={checkAlerts}>Check Alerts</button></div>
-      </div>
-
-      <div style={{ marginTop: 16 }}>
-        <CandleControls interval={interval} setInterval={setIntervalState} range={range} setRange={setRangeState} />
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 16, marginTop: 16 }}>
+      {/* main */}
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 360px", gap: 16 }}>
+        {/* left column */}
         <div>
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8 }}>
+          {/* quote card */}
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8 }}>
             <h3 style={{ marginTop: 0 }}>Quote</h3>
             {quote && quote.data ? (
               <>
                 <div style={{ fontSize: 20, fontWeight: 700 }}>{quote.symbol}</div>
                 <div>Timestamp: {tsToLocal(quote.data.t)}</div>
-                <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+                <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
                   <div>Current: <strong>{fmt(quote.data.c)}</strong></div>
                   <div>Open: {fmt(quote.data.o)}</div>
                   <div>High: {fmt(quote.data.h)}</div>
@@ -429,40 +398,46 @@ export default function App() {
                   <div>Prev Close: {fmt(quote.data.pc)}</div>
                 </div>
               </>
-            ) : <div>No data</div>}
+            ) : <div>No quote</div>}
           </section>
 
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8, marginTop: 12 }}>
-            <h3 style={{ marginTop: 0 }}>Chart ({range} / {interval})</h3>
-            <div style={{ fontSize: 12, color: '#555', marginBottom: 6 }}>
-              Last trading day: <strong>{lastTradeDay || 'n/a'}</strong> • Market close (regular): <strong>4:00 PM ET</strong>
+          {/* chart */}
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, marginTop: 12 }}>
+            <h3 style={{ marginTop: 0 }}>Price Chart ({range} / {interval})</h3>
+            <div style={{ fontSize: 12, color: "#555", marginBottom: 6 }}>
+              Last trading day: <strong>{lastTradeDay || "n/a"}</strong> • Market close (regular): <strong>4:00 PM ET</strong>
             </div>
-            {hist && hist.closes ? (
-              <CandleChart timestamps={hist.timestamps} opens={hist.opens} highs={hist.highs} lows={hist.lows} closes={hist.closes} volumes={hist.volumes || []} width={740} height={360} />
-            ) : <div>No history</div>}
+            <div style={{ overflowX: "auto" }}>
+              <LineAreaChart
+                timestamps={hist ? hist.timestamps : []}
+                closes={hist ? hist.closes : []}
+                width={740}
+                height={340}
+                previousClose={quote && quote.data ? quote.data.pc : null}
+                topLeftBox={topLeftBox}
+              />
+            </div>
           </section>
 
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8, marginTop: 12 }}>
-            <h3 style={{ marginTop: 0 }}>Indicators</h3>
+          {/* indicators + summary */}
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, marginTop: 12 }}>
+            <h3 style={{ marginTop: 0 }}>Indicators & Summary</h3>
             {ind ? (
               <div>
-                <div>MA50: {ind.ma50 ? fmt(ind.ma50) : 'n/a'}</div>
-                <div>MA200: {ind.ma200 ? fmt(ind.ma200) : 'n/a'}</div>
-                <div>EMA20: {ind.ema20 ? fmt(ind.ema20) : 'n/a'}</div>
-                <div>RSI14: {ind.rsi14 ? fmt(ind.rsi14) : 'n/a'}</div>
-                <div>MACD: {ind.macd && ind.macd.macd ? Number(ind.macd.macd).toFixed(3) : 'n/a'}</div>
+                <div>MA50: {ind.ma50 ? fmt(ind.ma50) : "n/a"}</div>
+                <div>MA200: {ind.ma200 ? fmt(ind.ma200) : "n/a"}</div>
+                <div>EMA20: {ind.ema20 ? fmt(ind.ema20) : "n/a"}</div>
+                <div>RSI14: {ind.rsi14 ? fmt(ind.rsi14) : "n/a"}</div>
+                <div>MACD: {ind.macd && ind.macd.macd ? Number(ind.macd.macd).toFixed(3) : "n/a"}</div>
               </div>
-            ) : <div>No indicators</div>}
-          </section>
-
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8, marginTop: 12 }}>
-            <h3 style={{ marginTop: 0 }}>Summary</h3>
-            <div>{summary || 'Click Get recommendation to generate summary.'}</div>
+            ) : <div>Loading indicators...</div>}
+            <div style={{ marginTop: 8 }}>{summary || "Summary will appear here."}</div>
           </section>
         </div>
 
+        {/* right column */}
         <div>
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8 }}>
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8 }}>
             <h3 style={{ marginTop: 0 }}>Recommendation</h3>
             {rec && rec.rec ? (
               <>
@@ -471,16 +446,17 @@ export default function App() {
                 <div>Recent Close: {rec.rec.recentClose}</div>
                 <div>MA50: {fmt(rec.rec.ma50)} MA200: {fmt(rec.rec.ma200)}</div>
               </>
-            ) : rec && rec.error ? <div style={{ color: 'red' }}>{rec.error}</div> : <div>Click Get recommendation</div>}
+            ) : rec && rec.error ? <div style={{ color: "red" }}>{rec.error}</div> : <div>Click Get recommendation</div>}
+            <div style={{ marginTop: 8 }}>
+              <button onClick={getRecommendation}>Get recommendation</button>
+            </div>
           </section>
 
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8, marginTop: 12 }}>
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, marginTop: 12 }}>
             <h3 style={{ marginTop: 0 }}>Portfolio</h3>
-            <div>
-              <button onClick={() => { const s = prompt('symbol'); const q = prompt('qty'); if (s && q) addToPortfolio(s.toUpperCase(), Number(q)); }}>Add position</button>
-            </div>
+            <div><button onClick={() => { const s = prompt("symbol"); const q = prompt("qty"); if (s && q) addToPortfolio(s.toUpperCase(), Number(q)); }}>Add position</button></div>
             <ul>
-              {portfolio.map(p => (
+              {portfolio.map((p) => (
                 <li key={p.id}>
                   {p.symbol} — {p.qty}
                   <button style={{ marginLeft: 8 }} onClick={() => removeFromPortfolio(p.id)}>remove</button>
@@ -489,13 +465,20 @@ export default function App() {
             </ul>
           </section>
 
-          <section style={{ border: '1px solid #ddd', padding: 12, borderRadius: 8, marginTop: 12 }}>
+          <section style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, marginTop: 12 }}>
             <h3 style={{ marginTop: 0 }}>Alerts</h3>
             <div>
-              <button onClick={() => { const s = prompt('symbol'); const type = prompt('type: gt or lt'); const price = prompt('price'); const webhook = prompt('optional webhook url'); if (s && type && price) createAlert(s.toUpperCase(), type, Number(price), webhook || null); }}>Create alert</button>
+              <button onClick={() => {
+                const s = prompt("symbol");
+                const type = prompt("type: gt or lt");
+                const price = prompt("price");
+                const webhook = prompt("optional webhook url");
+                if (s && type && price) createAlert(s.toUpperCase(), type, Number(price), webhook || null);
+              }}>Create alert</button>
+              <button style={{ marginLeft: 8 }} onClick={() => checkAlerts()}>Check Alerts</button>
             </div>
             <ul>
-              {alerts.map(a => (
+              {alerts.map((a) => (
                 <li key={a.id}>
                   {a.symbol} {a.type} {a.price} <button onClick={() => removeAlert(a.id)}>x</button>
                 </li>
@@ -505,7 +488,7 @@ export default function App() {
         </div>
       </div>
 
-      <footer style={{ marginTop: 20, fontSize: 12, color: '#666' }}>Demo and prototype — not financial advice.</footer>
+      <footer style={{ marginTop: 20, fontSize: 12, color: "#666" }}>Demo and prototype — not financial advice.</footer>
     </div>
   );
 }
